@@ -4,6 +4,6 @@ __pycache__/
 .env
 results/
 # runtime databases stay out of git, but the two bundled demo databases (data/) are part of the project
-*.sqlite
+*.sqlite*
 !data/*.sqlite
 .pytest_cache/

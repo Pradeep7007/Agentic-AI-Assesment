@@ -98,3 +98,50 @@ Push to `main`, wait for the GitHub Action, and submit the run URL: see **[docs/
 | `/login` or MCP says a table does not exist | the migration did not run: `docker compose run --rm migrate` and look at its output |
 
 Use this file for your own notes: how you solved each task, a screenshot of your Grafana panel. It is not graded, but graders may read it.
+
+## Implementation Notes
+
+### Task 1: Define the Agent (`src/app/agent.py`)
+- Registered all tools in `build_agent`: `S1_TOOLS`, `build_kb_tools(kb)`, `await mcp_tools()`, and `build_custom_tools(kb)`.
+- Implemented `@dynamic_prompt` returning `SYSTEM_PROMPT` plus `kb.prompt_block(kb_id)` dynamically on each model invocation, where `kb_id` is resolved from `request.runtime.context.user_id` or `session_id`.
+- Passed `middleware=[dynamic_kb_prompt, ShrinkOldToolResults()]`, `context_schema=Ctx`, and `checkpointer=checkpointer` to `create_agent`.
+
+### Task 2: Make the Tools Async (`src/app/tools_s1.py`, `src/app/kb/tools.py`)
+- Converted `get_weather`, `web_fetch`, `sql_query`, and `search_knowledge_base` to `async def`.
+- In `web_fetch`, used `httpx.AsyncClient` with non-blocking extraction via `asyncio.to_thread(trafilatura.extract, ...)`.
+- In `sql_query`, encapsulated sqlite execution in a helper function invoked via `asyncio.to_thread`.
+- In `search_knowledge_base`, called `kb.search` and `kb.resolve_doc_name` via `asyncio.to_thread`.
+
+### Task 3: Chat Memory in SQLite (`src/app/persistence.py`, `src/app/main.py`)
+- Replaced `InMemorySaver` with `AsyncSqliteSaver.from_conn_string` inside `open_checkpointer` async context manager, ensuring the checkpoint directory exists.
+- Updated `main.py` lifespan to open the checkpointer at startup and hold it open for the app lifecycle.
+
+### Task 4: Alembic Migration (`src/app/migrations/0001_create_users.py`)
+- Created revision `0001_create_users` defining tables `users`, `tokens`, and `threads` with all required columns.
+- Implemented `upgrade` to create the tables and `downgrade` to drop them in reverse dependency order.
+
+### Task 5: User Accounts and Auth (`src/app/main.py`)
+- Added `POST /users` (returns 201 with `user_id`, 409 if taken, 422 if credentials invalid).
+- Added `POST /login` (returns 200 with `token` and `user_id`, 401 on failure).
+- Added `get_current_user` FastAPI dependency validating `Authorization: Bearer <token>` via `UserStore.user_for_token`.
+- Added `GET /me`, `POST /logout` (revoking the active token), and `DELETE /users/me`.
+
+### Task 6: One Knowledge Base per User (`src/app/context.py`, `src/app/agent.py`, `src/app/kb/tools.py`, `src/app/main.py`)
+- Extended `Ctx` with `user_id` and `token`.
+- Protected `/agent` and `/upload` with `get_current_user` and thread ownership checking via `claim_thread` (answering 403 on conflict).
+- Switched knowledge base indexing, querying, and dynamic prompting to key on `user_id`.
+- Wired `DELETE /users/me` to call `kb.reset(user_id)`.
+
+### Task 7: Two Tools with Observability (`src/app/custom_tools.py`, `src/app/dashboards/outline.json`)
+- Implemented `kb_stats(top_keywords=5)` validating `1 <= top_keywords <= 20` (raising `ERROR[INVALID_INPUT]`), recording counter `kbstats.calls` and logging `kb_stats_done`.
+- Implemented `document_outline(doc_name)` resolving document name, retrieving sections, formatting outline with page numbers, recording counter `outline.calls` and logging `document_outline_done`.
+- Created Grafana dashboard `src/app/dashboards/outline.json` for outline metrics and logs.
+
+### Task 8: Manage Knowledge Base with Tools (`src/app/custom_tools.py`)
+- Implemented `delete_document(doc_name)` deleting the user's document via `kb.delete_document` and returning remaining count.
+- Implemented `update_document(doc_name, source)` resolving upload, ingesting the new version under the existing name first, and deleting the old document only upon success.
+
+### Task 9: Notes and Tasks MCP Server with Per-User Auth (`src/app/mcp_server/server.py`, `src/app/agent.py`)
+- In `server.py`, registered all 8 tools (`add_note`, `list_notes`, `delete_note`, `add_task`, `list_tasks`, `set_task_status`, `delete_task`, `task_summary`).
+- Extracted caller identity using `ctx.request_context.request.headers` via `current_user_id`, raising `ToolError("ERROR[UNAUTHENTICATED]: ...")` if unauthorized.
+- In `agent.py`, implemented `mcp_auth_interceptor` forwarding `Authorization: Bearer <runtime.context.token>` to the MCP server.

@@ -1,12 +1,14 @@
+import asyncio
 import time
 import uuid
 from contextlib import asynccontextmanager
 
 import structlog
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.staticfiles import StaticFiles
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.instrumentation.httpx import HTTPXClientInstrumentor
+from pydantic import BaseModel
 
 from app.telemetry import (  # first: providers must exist before LangChain runs
     RUN_STEPS, HTTP_DURATION, HTTP_REQUESTS, configure_logging, log, run_config, setup_telemetry,
@@ -26,19 +28,23 @@ from app.kb.store import KnowledgeBase
 from app.persistence import open_checkpointer
 from app.schemas import AgentRequest, AgentResponse, KBResponse, UploadResponse
 from app.tools_s1 import CHARTS_DIR
+from app.users import InvalidCredentials, UserStore, UsernameTaken
+
+
+class UserAuthRequest(BaseModel):
+    username: str
+    password: str
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.kb = KnowledgeBase()  # loads the embedder, opens Qdrant + SQLite
-    # TODO(task 3): integrate the checkpointer. `open_checkpointer()` (persistence.py) is an async CONTEXT MANAGER that you
-    #   write: open it here, pass the saver to build_agent(..., checkpointer=saver), and keep it open until shutdown
-    #   (everything from build_agent to `yield` goes inside the `async with`). Today the agent has no memory at all.
-    agent, tools = await build_agent(app.state.kb)
-    app.state.agent, app.state.tools = agent, tools
-    app.state.tool_names = [t.name for t in tools]
-    log.info("startup_complete", tools=app.state.tool_names)
-    yield
+    async with open_checkpointer() as checkpointer:
+        agent, tools = await build_agent(app.state.kb, checkpointer=checkpointer)
+        app.state.agent, app.state.tools = agent, tools
+        app.state.tool_names = [t.name for t in tools]
+        log.info("startup_complete", tools=app.state.tool_names)
+        yield
     shutdown_telemetry()
 
 
@@ -71,22 +77,72 @@ async def observe(request: Request, call_next):
                      duration_ms=round(elapsed * 1000))
 
 
-# TODO(task 5): accounts. See users.py for the contract: POST /users, POST /login, GET /me, POST /logout, DELETE /users/me, and a
-#   FastAPI dependency that turns `Authorization: Bearer <token>` into the current user (401 otherwise), used by /agent, /upload and /kb.
-# TODO(task 6): one knowledge base per user. /agent passes context=Ctx(session_id=..., user_id=...); a chat thread belongs to the first
-#   user who uses it (claim_thread; 403 for anybody else).
-# TODO(task 9): /agent also puts the bearer token into Ctx (token=...), so the MCP calls can run as that user.
+async def get_current_user(request: Request) -> dict:
+    auth = request.headers.get("Authorization") or request.headers.get("authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
+    token = auth[7:].strip()
+    store = UserStore()
+    user = await asyncio.to_thread(store.user_for_token, token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.")
+    return {**user, "token": token}
+
+
+@app.post("/users", status_code=201)
+async def register(req: UserAuthRequest):
+    store = UserStore()
+    try:
+        res = await asyncio.to_thread(store.create, req.username, req.password)
+        return res
+    except InvalidCredentials as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except UsernameTaken as exc:
+        raise HTTPException(status_code=409, detail=f"Username '{req.username}' is already taken.") from exc
+
+
+@app.post("/login")
+async def login(req: UserAuthRequest):
+    store = UserStore()
+    res = await asyncio.to_thread(store.login, req.username, req.password)
+    if not res:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    return res
+
+
+@app.get("/me")
+async def me(user: dict = Depends(get_current_user)):
+    return {"user_id": user["user_id"], "username": user["username"]}
+
+
+@app.post("/logout", status_code=204)
+async def logout(user: dict = Depends(get_current_user)):
+    store = UserStore()
+    await asyncio.to_thread(store.revoke, user["token"])
+    return Response(status_code=204)
+
+
+@app.delete("/users/me", status_code=204)
+async def delete_me(request: Request, user: dict = Depends(get_current_user)):
+    store = UserStore()
+    await asyncio.to_thread(store.delete_user, user["user_id"])
+    request.app.state.kb.reset(user["user_id"])
+    return Response(status_code=204)
 
 
 @app.post("/agent", response_model=AgentResponse)
-async def agent(req: AgentRequest, request: Request):
+async def agent(req: AgentRequest, request: Request, user: dict = Depends(get_current_user)):
     """The agent decides: Session 1 tools, ingest_document, search_knowledge_base (cites document and section), MCP notes."""
+    store = UserStore()
+    allowed = await asyncio.to_thread(store.claim_thread, req.thread_id, user["user_id"])
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Thread belongs to another user.")
     structlog.contextvars.bind_contextvars(thread_id=req.thread_id)
     result = await _guard(
         request.app.state.agent.ainvoke(
             {"messages": [{"role": "user", "content": req.message}]},
             config=run_config(thread_id=req.thread_id),
-            context=Ctx(session_id=req.thread_id),
+            context=Ctx(session_id=req.thread_id, user_id=user["user_id"], token=user["token"]),
         )
     )
     msgs = result["messages"]
@@ -99,8 +155,12 @@ async def agent(req: AgentRequest, request: Request):
 
 
 @app.post("/upload", response_model=UploadResponse)
-async def upload(request: Request, file: UploadFile = File(...), session_id: str = Form(...)):
+async def upload(request: Request, file: UploadFile = File(...), session_id: str = Form(...), user: dict = Depends(get_current_user)):
     """Store a file for this session. It is NOT indexed yet: the agent calls ingest_document(file_id)."""
+    store = UserStore()
+    allowed = await asyncio.to_thread(store.claim_thread, session_id, user["user_id"])
+    if not allowed:
+        raise HTTPException(status_code=403, detail="Thread belongs to another user.")
     data = await file.read(files.MAX_BYTES + 1)
     try:
         file_id, path = files.save_upload(session_id, file.filename or "file", data)
@@ -111,20 +171,25 @@ async def upload(request: Request, file: UploadFile = File(...), session_id: str
 
 
 @app.get("/kb/{session_id}", response_model=KBResponse)
-async def kb_state(session_id: str, request: Request):
-    """What this session's knowledge base holds, and exactly what the agent is told about it."""
+async def kb_state(session_id: str, request: Request, user: dict = Depends(get_current_user)):
+    """What this user's knowledge base holds, and exactly what the agent is told about it."""
     kb: KnowledgeBase = request.app.state.kb
     try:
         files.safe_session(session_id)
     except DocError as exc:
         raise HTTPException(status_code=422, detail=exc.message) from exc
-    prof = kb.get_profile(session_id) or {"overview": None, "keywords": []}
-    return KBResponse(**prof, documents=kb.documents(session_id), prompt_block=kb.prompt_block(session_id))
+    user_id = user["user_id"]
+    prof = kb.get_profile(user_id) or {"overview": None, "keywords": []}
+    return KBResponse(**prof, documents=kb.documents(user_id), prompt_block=kb.prompt_block(user_id))
 
 
 @app.delete("/kb/{session_id}")
-async def kb_reset(session_id: str, request: Request):
-    request.app.state.kb.reset(files.safe_session(session_id))
+async def kb_reset(session_id: str, request: Request, user: dict = Depends(get_current_user)):
+    try:
+        files.safe_session(session_id)
+    except DocError as exc:
+        raise HTTPException(status_code=422, detail=exc.message) from exc
+    request.app.state.kb.reset(user["user_id"])
     return {"status": "cleared"}
 
 
