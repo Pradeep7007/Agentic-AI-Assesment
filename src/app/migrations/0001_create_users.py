@@ -41,3 +41,4 @@ def downgrade() -> None:
     op.drop_table('threads')
     op.drop_table('tokens')
     op.drop_table('users')
+
